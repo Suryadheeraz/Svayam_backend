@@ -1,0 +1,239 @@
+# main.py
+
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
+
+# Silence the "localhost" SSL warnings
+warnings.simplefilter('ignore', InsecureRequestWarning)
+# Silence Pydantic V1 warnings
+warnings.filterwarnings("ignore", message=".*Pydantic V1 functionality.*")
+
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer # Added OAuth2PasswordBearer type hint if needed, though mostly handled in security.py
+from sqlalchemy.orm import Session
+import random
+import string
+from datetime import datetime, timedelta
+from langsmith import Client  # <--- NEW IMPORT
+import os
+from collections import defaultdict
+
+# Import components
+from database import User, init_db, get_db
+# --- FIX: Imported oauth2_scheme directly ---
+from security import (
+    create_session, 
+    delete_session,
+    get_current_user, 
+    verify_password,
+    oauth2_scheme 
+)
+from api import users, knowledgebase, search, conversations 
+
+# Create database tables on startup
+init_db()
+
+app = FastAPI()
+
+# --- Configure CORS ---
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://wonderful-grass-043c527003.azurestaticapps.net", 
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Include all API routers ---
+app.include_router(users.router)
+app.include_router(knowledgebase.router)
+app.include_router(search.router)
+app.include_router(conversations.router) # <--- Add this line
+
+# ---------------------- AUTH ENDPOINTS ----------------------
+
+@app.post("/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    # 1. Verify Credentials
+    user = db.query(User).filter(User.email == form_data.username).first()
+    
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        
+    # 2. Create a DB Session (Stateful)
+    session_id = create_session(db, user.id)
+    
+    # 3. Return the Session ID 
+    # We use the key "access_token" so your frontend code doesn't need to change.
+    return {
+        "access_token": session_id, 
+        "token_type": "bearer",
+        "user": {
+            "email": user.email,
+            "name": user.name,
+            "role": user.role,
+        },
+    }
+
+@app.post("/logout")
+def logout(
+    token: str = Depends(oauth2_scheme), # --- FIX: Removed 'security.' prefix
+    db: Session = Depends(get_db)
+):
+    # 1. Delete the session from the DB
+    delete_session(db, token)
+    return {"message": "Logged out successfully"}
+
+# @app.get("/api/admin/analytics")
+# def get_analytics(
+#     # We protect this route so only Admins can see it
+#     current_user = Depends(get_current_user) 
+# ):
+#     if current_user.role != "admin":
+#         raise HTTPException(status_code=403, detail="Not authorized")
+
+#     # 1. Initialize LangSmith
+#     client = Client()
+#     project_name = os.getenv("LANGCHAIN_PROJECT", "svayam-chatbot-prod")
+
+#     # 2. Fetch runs from last 7 days
+#     try:
+#         runs = list(client.list_runs(
+#             project_name=project_name,
+#             is_root=True, # Only count top-level interactions
+#             start_time=datetime.now() - timedelta(days=7)
+#         ))
+#     except Exception as e:
+#         print(f"LangSmith Error: {e}")
+#         return {"total_requests": 0, "total_tokens": 0, "total_cost": 0, "avg_latency": 0}
+
+#     total_runs = len(runs)
+#     total_tokens = 0
+#     total_cost = 0.0 # This is a float
+#     total_latency = 0.0
+
+#     for run in runs:
+#         # Sum Tokens
+#         if run.total_tokens:
+#             total_tokens += run.total_tokens
+        
+#         # Sum Cost (FIX: Convert Decimal to float)
+#         if hasattr(run, "total_cost") and run.total_cost:
+#             # LangSmith returns a Decimal, we must cast to float before adding
+#             total_cost += float(run.total_cost)
+
+#         # Sum Latency
+#         if run.end_time and run.start_time:
+#             latency = (run.end_time - run.start_time).total_seconds()
+#             total_latency += latency
+
+#     avg_latency = (total_latency / total_runs) if total_runs > 0 else 0
+
+#     return {
+#         "total_requests": total_runs,
+#         "total_tokens": total_tokens,
+#         "total_cost": round(total_cost, 4),
+#         "avg_latency": round(avg_latency, 2)
+#     }
+
+@app.get("/api/admin/analytics")
+def get_analytics(current_user=Depends(get_current_user)):
+    """
+    Fetches AI usage stats from LangSmith, including DAILY trends.
+    """
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    try:
+        client = Client()
+        project_name = os.getenv("LANGCHAIN_PROJECT", "svayam-chatbot-prod")
+
+        # Fetch runs from last 7 days
+        runs = list(client.list_runs(
+            project_name=project_name,
+            is_root=True, 
+            start_time=datetime.now() - timedelta(days=7)
+        ))
+    except Exception as e:
+        print(f"LangSmith Connection Error: {e}")
+        return {"total_requests": 0, "total_tokens": 0, "total_cost": 0, "avg_latency": 0, "daily_trends": []}
+
+    # --- AGGREGATION LOGIC ---
+    total_runs = len(runs)
+    total_tokens = 0
+    total_cost = 0.0
+    total_latency = 0.0
+    
+    # Dictionary to group data by date: "2023-10-27": { ...stats... }
+    daily_map = defaultdict(lambda: {"requests": 0, "tokens": 0, "cost": 0.0, "latency_sum": 0.0})
+
+    for run in runs:
+        # Get Date string (YYYY-MM-DD)
+        date_str = run.start_time.strftime("%Y-%m-%d")
+        
+        # 1. Requests
+        daily_map[date_str]["requests"] += 1
+        
+        # 2. Tokens
+        tokens = run.total_tokens or 0
+        total_tokens += tokens
+        daily_map[date_str]["tokens"] += tokens
+        
+        # 3. Cost
+        cost = 0.0
+        if hasattr(run, "total_cost") and run.total_cost:
+            cost = float(run.total_cost)
+            total_cost += cost
+            daily_map[date_str]["cost"] += cost
+
+        # 4. Latency
+        latency = 0.0
+        if run.end_time and run.start_time:
+            latency = (run.end_time - run.start_time).total_seconds()
+            total_latency += latency
+            daily_map[date_str]["latency_sum"] += latency
+
+    # Calculate Averages and formatting
+    avg_latency = (total_latency / total_runs) if total_runs > 0 else 0
+    
+    # Convert daily_map to a sorted list for the frontend graph
+    daily_trends = []
+    # Ensure we cover the last 7 days even if empty
+    for i in range(6, -1, -1):
+        day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        stats = daily_map.get(day, {"requests": 0, "tokens": 0, "cost": 0.0, "latency_sum": 0.0})
+        
+        # Calculate daily avg latency
+        daily_avg_latency = (stats["latency_sum"] / stats["requests"]) if stats["requests"] > 0 else 0
+        
+        daily_trends.append({
+            "date": day, # X-Axis value
+            "requests": stats["requests"],
+            "tokens": stats["tokens"],
+            "cost": round(stats["cost"], 4),
+            "avg_latency": round(daily_avg_latency, 2)
+        })
+
+    return {
+        "total_requests": total_runs,
+        "total_tokens": total_tokens,
+        "total_cost": round(total_cost, 4),
+        "avg_latency": round(avg_latency, 2),
+        "daily_trends": daily_trends # <--- New List for Graphs
+    }
+
+
+# --- Root Endpoint ---
+@app.get("/")
+async def root():
+    return {"message": "Welcome to SVAYAM-AMS API"}
