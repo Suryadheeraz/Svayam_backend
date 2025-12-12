@@ -3,9 +3,10 @@ from database_model import SessionLocal, User
 db = SessionLocal()
 
 users = [
-    ("admin@company.com", "Admin", "admin123", "admin"),
-    ("john.doe@company.com", "John Doe", "pass123", "user"),
-    ("alice.smith@company.com", "Alice Smith", "pass123", "user"),
+    # ("admin@company.com", "Dheeraz", "admin123", "admin"),
+    ("kumar@user.com", "Kumar", "kumar123", "user"),
+    ("kumar@admin.com", "kumar", "admin123", "admin")
+    # ("alice.smith@company.com", "Alice Smith", "pass123", "user")
 ]
 
 for email, name, pwd, role in users:

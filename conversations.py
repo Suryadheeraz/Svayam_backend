@@ -279,8 +279,9 @@ from azure.cosmos import CosmosClient, PartitionKey, exceptions
 from pydantic import BaseModel
 
 # --- Security & Database Imports ---
-from database import User
-from security import get_current_user, get_current_admin_user
+from database_model import User
+from main import get_current_user, get_current_admin_user
+from main import get_db
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -610,3 +611,14 @@ def create_conversation(data: Dict[str, Any], user: User = Depends(get_current_u
         return {"message": "Conversation created", "id": thread_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@router.get("/conversations")
+def get_all_conversations(db: Session = Depends(get_db), admin: User = Depends(get_current_admin_user)):
+    convs = db.query(Conversation).order_by(Conversation.created_at.desc()).all()
+    return [{
+        "conversation_uuid": c.uuid,
+        "topic": c.topic,
+        "startDate": c.created_at,
+        "isResolved": c.is_resolved,
+        "user": c.user_email
+    } for c in convs]

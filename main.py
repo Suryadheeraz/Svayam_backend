@@ -4433,6 +4433,7 @@ from chatbot.cosmos_store import (
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_openai import AzureChatOpenAI
 
+
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -4712,6 +4713,8 @@ app = FastAPI()
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
     "https://wonderful-grass-043c527003.azurestaticapps.net",
 ]
 
@@ -4764,6 +4767,7 @@ def get_current_admin_user(current_user: User = Depends(get_current_user)) -> Us
     if current_user.role != "admin":
         raise HTTPException(403, "Admin access required")
     return current_user
+
 
 # include knowledgebase routes (if exists)
 try:
@@ -5117,6 +5121,26 @@ def get_all_users(admin: User = Depends(get_current_admin_user), db: Session = D
     users = db.query(User).all()
     return {"users": [{"id": u.id, "email": u.email, "name": u.name, "role": u.role} for u in users]}
 
+@app.get("/admin/all-conversations")
+def admin_all_conversations(
+    admin: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db)
+):
+    convs = db.query(Conversation).order_by(Conversation.created_at.desc()).all()
+
+    return [
+        {
+            "conversation_uuid": c.conversation_uuid,
+            "topic": c.topic,
+            "startDate": c.created_at,
+            "isResolved": False,  # SQL model does not track resolution
+            "user": c.user.email if c.user else None,
+            "project": c.project.name if c.project else None
+        }
+        for c in convs
+    ]
+
+
 # -------------------------------------------------------------------------
 # Analytics (LangSmith) - optional
 # -------------------------------------------------------------------------
@@ -5174,4 +5198,213 @@ def get_analytics(current_user=Depends(get_current_user)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="127.0.0.1", port=int(os.getenv("PORT", 8000)), reload=True)
+    
+@app.get("/admin/users")
+def admin_list_users(
+    admin: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db)
+):
+    users = db.query(User).all()
+
+    # return in the shape frontend expects
+    return {
+        "users": [
+            {
+                "email": u.email,
+                "name": u.name,
+                "role": u.role
+            }
+            for u in users
+        ]
+    }
+
+@app.post("/admin/create")
+def admin_create_user(data: dict, admin: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    user = User(
+        email=data["email"],
+        name=data["name"],     
+        password=data["password"],
+        role=data["role"]
+    )
+    db.add(user)
+    db.commit()
+    return {"message": "User created successfully"}
+@app.put("/admin/users/{email}")
+def admin_update_user(email: str, data: dict, admin: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    if "name" in data:
+        user.name = data["name"]
+
+    if "role" in data:
+        user.role = data["role"]
+
+    if "password" in data:
+        user.password = data["password"]
+
+    db.commit()
+    return {"message": "User updated successfully"}
+@app.delete("/admin/users/{email}")
+def admin_delete_user(email: str, admin: User = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    db.delete(user)
+    db.commit()
+    return {"message": "User deleted successfully"}
+
+
+# =========================================================
+# COSMOS DB CHAT STORAGE (Moved from conversations.py)
+# =========================================================
+
+from azure.cosmos import CosmosClient, PartitionKey
+from fastapi import APIRouter
+
+cosmos_router = APIRouter(prefix="/api/conversations", tags=["Conversations"])
+
+COSMOS_ENDPOINT = os.getenv("COSMOS_ENDPOINT")
+COSMOS_KEY = os.getenv("COSMOS_KEY")
+COSMOS_DATABASE = os.getenv("COSMOS_DATABASE", "svayam-db")
+COSMOS_CONTAINER = os.getenv("COSMOS_CONTAINER", "conversations")
+
+client = None
+if COSMOS_ENDPOINT and COSMOS_KEY:
+    try:
+        client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY, connection_verify=False)
+        print("Cosmos connected")
+    except Exception as e:
+        print("⚠️ Cosmos init failed:", e)
+
+def _get_container():
+    if not client:
+        raise HTTPException(500, "Cosmos not initialized")
+    db = client.create_database_if_not_exists(id=COSMOS_DATABASE)
+    container = db.create_container_if_not_exists(
+        id=COSMOS_CONTAINER,
+        partition_key=PartitionKey(path="/thread_id"),
+        offer_throughput=400
+    )
+    return container
+
+def append_message(thread_id, role, content, metadata=None):
+    c = _get_container()
+    doc = {
+        "id": str(uuid.uuid4()),
+        "thread_id": thread_id,
+        "role": role,
+        "content": content,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "metadata": metadata or {}
+    }
+    return c.create_item(body=doc)
+
+def load_messages(thread_id):
+    c = _get_container()
+    q = "SELECT * FROM c WHERE c.thread_id=@tid ORDER BY c.timestamp ASC"
+    params = [{"name": "@tid", "value": thread_id}]
+    return list(c.query_items(q, parameters=params, enable_cross_partition_query=False))
+
+def list_recent_threads(limit=20):
+    c = _get_container()
+    q = f"SELECT TOP {limit*50} c.thread_id, c.timestamp FROM c ORDER BY c.timestamp DESC"
+    rows = list(c.query_items(q, enable_cross_partition_query=True))
+    seen = set()
+    threads = []
+    for r in rows:
+        tid = r.get("thread_id")
+        if tid and tid not in seen:
+            seen.add(tid)
+            threads.append(tid)
+            if len(threads) >= limit:
+                break
+    return threads
+
+def list_user_threads(email):
+    c = _get_container()
+    q = "SELECT DISTINCT VALUE c.thread_id FROM c WHERE c.metadata.userEmail=@e"
+    return list(c.query_items(q, parameters=[{"name":"@e", "value": email}], enable_cross_partition_query=True))
+
+def map_cosmos_to_frontend(thread_id, messages):
+    mapped = []
+    topic = "New Conversation"
+    user_name = "Unknown"
+    start_date = datetime.utcnow().strftime("%Y-%m-%d")
+    priority = "Medium"
+    category = "General"
+    is_resolved = False
+
+    if messages:
+        meta = messages[0].get("metadata", {})
+        if meta:
+            topic = meta.get("topic") or topic
+            user_name = meta.get("userName", user_name)
+            priority = meta.get("priority", priority)
+            category = meta.get("category", category)
+            is_resolved = meta.get("isResolved", False)
+        raw_ts = messages[0].get("timestamp")
+        if raw_ts:
+            try:
+                dt = datetime.fromisoformat(raw_ts.replace("Z",""))
+                start_date = dt.strftime("%Y-%m-%d")
+            except:
+                pass
+
+    for m in messages:
+        mapped.append({
+            "sender": "ai" if m.get("role") == "assistant" else "user",
+            "text": m.get("content"),
+            "timestamp": m.get("timestamp")
+        })
+
+    return {
+        "id": thread_id,
+        "topic": topic,
+        "user": user_name,
+        "startDate": start_date,
+        "priority": priority,
+        "category": category,
+        "isResolved": is_resolved,
+        "messages": mapped
+    }
+@cosmos_router.get("/")
+def admin_conversations(admin: User = Depends(get_current_admin_user)):
+    thread_ids = list_recent_threads(20)
+    result = []
+    for tid in thread_ids:
+        msgs = load_messages(tid)
+        if msgs:
+            result.append(map_cosmos_to_frontend(tid, msgs))
+    return result
+
+@cosmos_router.get("/my")
+def my_conversations(user: User = Depends(get_current_user)):
+    thread_ids = list_user_threads(user.email)
+    result = []
+    for tid in thread_ids:
+        msgs = load_messages(tid)
+        if msgs:
+            result.append(map_cosmos_to_frontend(tid, msgs))
+    return sorted(result, key=lambda x: x["startDate"], reverse=True)
+
+@cosmos_router.post("/create")
+def create_conversation(data: dict, user: User = Depends(get_current_user)):
+    thread_id = str(uuid.uuid4())
+    message = data.get("message", "New Chat Started")
+    topic = data.get("topic", "New Inquiry")
+    metadata = {
+        "topic": topic,
+        "userEmail": user.email,
+        "userName": user.name,
+        "priority": "Medium",
+        "category": "General",
+        "isResolved": False
+    }
+    append_message(thread_id, "user", message, metadata)
+    return {"message": "created", "id": thread_id}
+
+app.include_router(cosmos_router)
 
