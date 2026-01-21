@@ -592,22 +592,31 @@ def sync_projects_with_storage(
         containers = blob_service_client.list_containers()
         blob_container_names = set()
         
+        # for container in containers:
+        #     container_name = container.name
+        #     # Skip the default container if you don't want it tracked
+        #     if container_name == CONTAINER_NAME:
+        #         continue
+                
+        #     blob_container_names.add(container_name)
+            
+        #     # Check if project exists in database
+        #     existing_project = db.query(Project).filter(Project.name == container_name).first()
+            
+        #     if not existing_project:
+        #         # Add new project to database
+        #         new_project = Project(name=container_name)
+        #         db.add(new_project)
+        #         print(f"✅ Added project to DB: {container_name}")
         for container in containers:
             container_name = container.name
-            # Skip the default container if you don't want it tracked
-            if container_name == CONTAINER_NAME:
-                continue
-                
             blob_container_names.add(container_name)
-            
-            # Check if project exists in database
-            existing_project = db.query(Project).filter(Project.name == container_name).first()
-            
+            existing_project = db.query(Project).filter(
+                Project.name == container_name
+                ).first()
             if not existing_project:
-                # Add new project to database
-                new_project = Project(name=container_name)
-                db.add(new_project)
-                print(f"✅ Added project to DB: {container_name}")
+                db.add(Project(name=container_name))
+
         
         # 2. Remove database entries for containers that don't exist in Azure
         db_projects = db.query(Project).all()
@@ -973,8 +982,8 @@ def list_containers(user: User = Depends(get_current_user), db: Session = Depend
         blob_container_names = set()
         
         for container in containers:
-            if container.name != CONTAINER_NAME:  # Skip default container
-                blob_container_names.add(container.name)
+            blob_container_names.add(container.name)
+
         
         # Check if sync is needed
         needs_sync = db_project_names != blob_container_names
@@ -1004,8 +1013,15 @@ def list_containers(user: User = Depends(get_current_user), db: Session = Depend
             # Refresh the project list
             db_projects = db.query(Project).all()
         
-        return [{"name": p.name, "type": "container", "project_uuid": str(p.project_uuid)} for p in db_projects]
-        
+        return [
+    {
+        "name": p.name,
+        "type": "container",
+        "project_uuid": str(p.project_uuid) if p.project_uuid else None
+    }
+    for p in db_projects
+]
+
     except Exception as e:
         raise HTTPException(500, f"Failed to list projects: {e}")
 

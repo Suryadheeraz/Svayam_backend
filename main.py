@@ -4427,7 +4427,7 @@ from chatbot.cosmos_store import (
     append_message,
     load_messages,
     delete_thread,
-    is_available as cosmos_is_available,
+    cosmos_is_available,
 )
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -5290,23 +5290,52 @@ def _get_container():
     )
     return container
 
-def append_message(thread_id, role, content, metadata=None):
+def append_message(project_name, thread_id, role, content, metadata=None, **kwargs):
+    """
+    New signature: accepts project_name because HybridStorageManager passes it.
+    """
     c = _get_container()
+
     doc = {
         "id": str(uuid.uuid4()),
+        "project_name": project_name,
         "thread_id": thread_id,
         "role": role,
         "content": content,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "metadata": metadata or {}
     }
+
     return c.create_item(body=doc)
 
-def load_messages(thread_id):
+
+def load_messages(project_name, thread_id, **kwargs):
+    """
+    New signature: HybridStorageManager passes (project_name, thread_id)
+    """
     c = _get_container()
-    q = "SELECT * FROM c WHERE c.thread_id=@tid ORDER BY c.timestamp ASC"
+
+    q = """
+    SELECT * FROM c 
+    WHERE c.thread_id=@tid 
+    ORDER BY c.timestamp ASC
+    """
+
     params = [{"name": "@tid", "value": thread_id}]
-    return list(c.query_items(q, parameters=params, enable_cross_partition_query=False))
+    return list(c.query_items(q, parameters=params, enable_cross_partition_query=True))
+
+
+def delete_thread(project_name, thread_id, **kwargs):
+    """
+    Needed by delete conversation.
+    """
+    c = _get_container()
+    q = "SELECT c.id FROM c WHERE c.thread_id=@tid"
+    params = [{"name": "@tid", "value": thread_id}]
+    items = list(c.query_items(q, parameters=params, enable_cross_partition_query=True))
+    
+    for item in items:
+        c.delete_item(item["id"], partition_key=thread_id)
 
 def list_recent_threads(limit=20):
     c = _get_container()

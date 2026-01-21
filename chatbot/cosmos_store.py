@@ -502,12 +502,27 @@ if not COSMOS_ENDPOINT or not COSMOS_KEY:
     raise RuntimeError("COSMOS_ENDPOINT or COSMOS_KEY is not set in environment/.env")
 
 # Cosmos client
-client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
+# client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
+_cosmos_client = None
+
+def get_cosmos_client():
+    global _cosmos_client
+    if _cosmos_client is None:
+        _cosmos_client = CosmosClient(
+            COSMOS_ENDPOINT,
+            COSMOS_KEY,
+            request_timeout=15,      # increase timeout
+            connection_timeout=15
+        )
+    return _cosmos_client
+
 
 # =====================================================
 #  Get DB + container (partition key = /project_name)
 # =====================================================
 def _get_db_and_container():
+    client = get_cosmos_client()
+
     db = client.create_database_if_not_exists(id=COSMOS_DATABASE)
     container = db.create_container_if_not_exists(
         id=COSMOS_CONTAINER,
@@ -667,7 +682,9 @@ def delete_thread(project_name: str, thread_id: str):
 # =====================================================
 _cosmos_available = None
 
-def is_available() -> bool:
+def cosmos_is_available() -> bool:
+    client = get_cosmos_client()
+
     global _cosmos_available
 
     if _cosmos_available is True:
