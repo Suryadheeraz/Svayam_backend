@@ -8,3 +8,5 @@ aiosqlite==0.21.0
 pydantic==2.12.4
 python-multipart
 python-dotenv
+python-jose[cryptography]
+
