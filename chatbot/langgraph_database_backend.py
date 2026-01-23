@@ -1,216 +1,40 @@
-# # langgraph_database_backend.py
-# import os
-# import sqlite3
-# from typing import TypedDict, Annotated
-
-# from dotenv import load_dotenv
-# from langgraph.graph import StateGraph, START, END
-# from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
-# from langchain_openai import ChatOpenAI, AzureChatOpenAI
-# from langgraph.checkpoint.sqlite import SqliteSaver
-# from langgraph.graph.message import add_messages
-
-# # optional retrieval
-# from azure.search.documents import SearchClient
-# from azure.core.credentials import AzureKeyCredential
-# from azure.core.pipeline.transport import RequestsTransport
-# import requests
-
-
-# load_dotenv()
-
-# llm = AzureChatOpenAI(
-#     azure_endpoint=os.getenv("AZURE_GPT4O_ENDPOINT"),
-#     deployment_name=os.getenv("AZURE_GPT4O_DEPLOYMENT"),
-#     openai_api_version=os.getenv("AZURE_GPT4O_API_VERSION"),
-#     api_key=os.getenv("AZURE_GPT4O_API_KEY"),
-#     temperature=0,
-#     streaming=True
-# )
-# classifier_llm = llm
-
-
-# AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
-# AZURE_SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
-# AZURE_SEARCH_INDEX = os.getenv("AZURE_SEARCH_INDEX")
-
-# if AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_KEY:
-#     session = requests.Session()
-#     adapter = requests.adapters.HTTPAdapter(pool_connections=0, pool_maxsize=0)
-#     session.mount("https://", adapter)
-#     session.mount("http://", adapter)
-#     session.headers.update({"Connection": "close"})
-#     transport = RequestsTransport(session=session)
-
-
-# def get_search_client(project_name: str):
-#     if not project_name:
-#         return None
-
-#     index_name = f"svayam-ams-{project_name}"
-
-#     session = requests.Session()
-#     adapter = requests.adapters.HTTPAdapter(pool_connections=0, pool_maxsize=0)
-#     session.mount("https://", adapter)
-#     session.mount("http://", adapter)
-#     session.headers.update({"Connection": "close"})
-#     transport = RequestsTransport(session=session)
-
-#     return SearchClient(
-#         endpoint=AZURE_SEARCH_ENDPOINT,
-#         index_name=index_name,
-#         credential=AzureKeyCredential(AZURE_SEARCH_KEY),
-#         transport=transport,
-#     )
-
-
-# def retrieve_docs(query: str, project_id: str, top: int = 3):
-#     """Fetch relevant docs from Azure Search (if configured)."""
-#     search_client = get_search_client(project_id)
-#     if not search_client or not query:
-#         return []
-
-#     results = search_client.search(search_text=query, top=top)
-#     docs = []
-#     for r in results:
-#         text = r.get("chunk") or r.get("content") or r.get("text") or ""
-#         if not text:
-#             continue
-#         if len(text) > 1200:
-#             text = text[:1200] + " ... [truncated]"
-#         title = (
-#             r.get("title")
-#             or r.get("metadata_storage_name")
-#             or r.get("file_name")
-#             or "Unknown Document"
-#         )
-#         docs.append({"id": r.get("id"), "title": title, "chunk": text})
-#     return docs
-
-
-# def is_greeting(text: str) -> bool:
-#     if not text or not text.strip():
-#         return False
-
-#     prompt = f"""
-# Classify the following user message as either GREETING or QUERY.
-
-# Message: "{text}"
-
-# Definitions:
-# - GREETING = A social greeting with NO request, NO issue, NO question.
-# - QUERY = Any message asking for help, describing a problem, or requiring information.
-
-# Respond with exactly one word: GREETING or QUERY.
-# """
-#     try:
-#         resp = classifier_llm.invoke([HumanMessage(content=prompt)])
-#         output = (resp.content or "").strip().upper()
-#         return output == "GREETING"
-#     except Exception:
-#         return False
-
-
-# def sanitize_ai_response(raw_text: str, user_text: str) -> str:
-#     if not raw_text:
-#         return ""
-#     txt = raw_text.strip()
-#     user = (user_text or "").strip()
-#     import re
-
-#     txt = re.sub(r"^\s*(GREETING|QUERY)\s*$", "", txt, flags=re.IGNORECASE).strip()
-#     if user:
-#         txt = re.sub(re.escape(user), "", txt, flags=re.IGNORECASE).strip()
-#     txt = re.sub(
-#         r"^(you asked|regarding your query|your question was|as you asked|about your question).*?(\.|:|\n)",
-#         "",
-#         txt,
-#         flags=re.IGNORECASE,
-#     ).strip()
-#     return txt.strip()
-
-
-# class ChatState(TypedDict):
-#     messages: Annotated[list[BaseMessage], add_messages]
-
-
-# def chat_node(state: ChatState,config: dict):
-#     messages = state.get("messages", [])
-
-#     user_text = ""
-#     for m in reversed(messages):
-#         if isinstance(m, HumanMessage):
-#             user_text = getattr(m, "content", "") or ""
-#             break
-
-#     project_name = config.get("configurable", {}).get("project_name") 
-#     greeting = is_greeting(user_text)
-    
-#     if not project_name:
-#         print("⚠️  WARNING: No project_name in config!")  # ✅ Added warning
-#     else:
-#         print(f"💬 Processing message for project: {project_name}")
-        
-#     retrieved = retrieve_docs(user_text, project_name, top=3) if (user_text and not greeting) else []
-
-#     if retrieved:
-#         blocks = []
-#         for i, d in enumerate(retrieved, start=1):
-#             blocks.append(f"Source [{i}]\nTitle: {d['title']}\nContent: {d['chunk']}")
-#         retrieved_block = "\n\n".join(blocks)
-#         system_prompt = (
-#             "You are an enterprise support assistant. Use the retrieved context when answering.\n\n"
-#             f"Retrieved Context:\n{retrieved_block}"
-#         )
-#     else:
-#         system_prompt = "You are a helpful enterprise assistant."
-
-#     response = llm.invoke([SystemMessage(content=system_prompt)] + messages)
-#     answer = getattr(response, "content", "").strip()
-
-#     if answer.upper() in ("GREETING", "QUERY"):
-#         answer = ""
-
-#     cleaned = sanitize_ai_response(answer, user_text)
-
-#     if not greeting:
-#         cleaned += "\n\n**Is your issue resolved?**"
-
-#     return {"messages": [AIMessage(content=cleaned)]}
-
-
-# conn = sqlite3.connect("chatbot.db", check_same_thread=False)
-# checkpointer = SqliteSaver(conn=conn)
-
-# graph = StateGraph(ChatState)
-# graph.add_node("chat_node", chat_node)
-# graph.add_edge(START, "chat_node")
-# graph.add_edge("chat_node", END)
-
-# chatbot = graph.compile(checkpointer=checkpointer)
-
-# __all__ = ["chatbot"]
-
 # langgraph_database_backend.py
-import os
-import sqlite3
-from typing import TypedDict, Annotated, Optional
 
+import os, io, re, sqlite3
+from typing import TypedDict, Annotated, Optional
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+import requests
 from dotenv import load_dotenv
+
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
-from langchain_openai import AzureChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
 
-# Azure Search
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+from langchain_openai import AzureChatOpenAI
+
+from azure.storage.blob import BlobServiceClient
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
 from azure.core.pipeline.transport import RequestsTransport
-import requests
-import re
+from openai import AzureOpenAI
 
 load_dotenv()
+
+# ---------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------
+
+BLOB_CONN_STR = os.getenv("AZURE_STORAGE_CONN_STR")
+CONTAINER_NAME = "svayamams"
+FOLDER_PREFIX = "SEWA/Tickets"
+
+AZURE_SEARCH_ENDPOINT = os.getenv("SEARCH_ENDPOINT")
+AZURE_SEARCH_KEY = os.getenv("SEARCH_KEY1")
+SEARCH_INDEX = "svayam-ams-sewa"
 
 # ---------------------------------------------------------
 # LLM CONFIG
@@ -225,129 +49,104 @@ llm = AzureChatOpenAI(
     streaming=True
 )
 
-classifier_llm = llm
-
-AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
-AZURE_SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
-
-
-# ---------------------------------------------------------
-# SEARCH CLIENT
-# ---------------------------------------------------------
-
-def get_search_client(project_name: str):
-    """Create search client if config exists."""
-    if not project_name or not AZURE_SEARCH_ENDPOINT or not AZURE_SEARCH_KEY:
-        return None
-
-    index_name = f"svayam-ams-sewa"
-    print(f"🔍 Using search index: {index_name}")
-
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=0, pool_maxsize=0)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update({"Connection": "close"})
-    transport = RequestsTransport(session=session)
-
-    try:
-        return SearchClient(
-            endpoint=AZURE_SEARCH_ENDPOINT,
-            index_name=index_name,
-            credential=AzureKeyCredential(AZURE_SEARCH_KEY),
-            transport=transport,
-        )
-    except Exception as e:
-        print(f"❌ Failed to create search client: {e}")
-        return None
-
-
-def retrieve_docs(query: str, project_name: str, top: int = 3):
-    """Retrieve relevant docs from Azure Search."""
-    if not query or not project_name:
-        return []
-
-    client = get_search_client(project_name)
-    if not client:
-        return []
-
-    try:
-        results = client.search(search_text=query, top=top)
-
-        docs = []
-        for r in results:
-            chunk = r.get("chunk") or r.get("content") or r.get("text") or ""
-            if not chunk:
-                continue
-            if len(chunk) > 1200:
-                chunk = chunk[:1200] + " ... [truncated]"
-
-            title = (
-                r.get("title") or r.get("metadata_storage_name") or
-                r.get("file_name") or "Unknown Document"
-            )
-
-            docs.append({"id": r.get("id"), "title": title, "chunk": chunk})
-
-        print(f"✅ Retrieved {len(docs)} docs")
-        return docs
-
-    except Exception as e:
-        print(f"❌ Search error: {e}")
-        return []
-
+openai_client = AzureOpenAI(
+    azure_endpoint=os.getenv("AZURE_GPT4O_ENDPOINT"),
+    api_key=os.getenv("AZURE_GPT4O_API_KEY"),
+    api_version="2024-12-01-preview"
+)
 
 # ---------------------------------------------------------
-# GREETING CLASSIFIER
+# CLIENTS
 # ---------------------------------------------------------
 
-def is_greeting(text: str) -> bool:
-    """Classify message as greeting or query."""
-    if not text.strip():
-        return False
+blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
+container_client = blob_service.get_container_client(CONTAINER_NAME)
 
-    prompt = f"""
-Classify as GREETING or QUERY:
-"{text}"
-
-GREETING = a greeting only.
-QUERY = a problem, request, or question.
-
-Respond with exactly one word.
-"""
-
-    try:
-        resp = classifier_llm.invoke([HumanMessage(content=prompt)])
-        out = (resp.content or "").strip().upper()
-        return out == "GREETING"
-    except:
-        return False
-
+search_client = SearchClient(
+    endpoint=AZURE_SEARCH_ENDPOINT,
+    index_name=SEARCH_INDEX,
+    credential=AzureKeyCredential(AZURE_SEARCH_KEY)
+)
 
 # ---------------------------------------------------------
-# SANITIZE RESPONSE
+# EMBEDDINGS
+# ---------------------------------------------------------
+
+def get_embedding(text: str):
+    emb = openai_client.embeddings.create(
+        model="text-embedding-3-large",
+        input=text
+    )
+    return np.array(emb.data[0].embedding)
+
+# ---------------------------------------------------------
+# BLOB EXCEL LOADER
+# ---------------------------------------------------------
+
+def load_excel_texts():
+    all_rows = []
+
+    for blob in container_client.list_blobs(name_starts_with=FOLDER_PREFIX):
+        if blob.name.endswith(".xlsx") or blob.name.endswith(".xls"):
+            stream = container_client.download_blob(blob.name).readall()
+            df = pd.read_excel(io.BytesIO(stream)).head(20)
+            df = df.astype(str)
+            text_dump = df.to_string(index=False)
+
+            all_rows.append({
+                "filename": blob.name,
+                "content": text_dump
+            })
+
+    return all_rows
+
+# ---------------------------------------------------------
+# SEMANTIC SEARCH (EXCEL)
+# ---------------------------------------------------------
+
+def semantic_search_excel(question, excel_rows, threshold=0.75):
+    q_emb = get_embedding(question)
+
+    best_match = None
+    best_score = 0
+
+    for item in excel_rows:
+        content_emb = get_embedding(item["content"])
+        score = np.dot(q_emb, content_emb) / (np.linalg.norm(q_emb) * np.linalg.norm(content_emb))
+
+        if score > best_score:
+            best_score = score
+            best_match = item
+
+    if best_score > threshold:
+        return best_match, best_score
+
+    return None, best_score
+
+# ---------------------------------------------------------
+# AZURE SEARCH
+# ---------------------------------------------------------
+
+def azure_search(query: str, top: int = 3):
+    results = search_client.search(search_text=query, top=top)
+    docs = []
+    for r in results:
+        chunk = r.get("chunk") or ""
+        title = r.get("title") or "KB Doc"
+        docs.append({"title": title, "chunk": chunk})
+    return docs
+
+# ---------------------------------------------------------
+# SANITIZER
 # ---------------------------------------------------------
 
 def sanitize_ai_response(raw: str, user_text: str):
-    """Remove greeting labels and echo of user text."""
     if not raw:
         return ""
-
     txt = raw.strip()
-    user = (user_text or "").strip()
-
-    txt = re.sub(r"^\s*(GREETING|QUERY)\s*$", "", txt, flags=re.IGNORECASE).strip()
-    if user:
-        txt = re.sub(re.escape(user), "", txt, flags=re.IGNORECASE).strip()
-
-    txt = re.sub(
-        r"^(you asked|regarding your query|your question was|as you asked|about your question).*?(\.|:|\n)",
-        "",
-        txt, flags=re.IGNORECASE
-    ).strip()
-
+    txt = re.sub(re.escape(user_text), "", txt, flags=re.IGNORECASE).strip()
+    txt = re.sub(r"^(as an ai|you asked|your question).*?(\.|:|\n)", "", txt, flags=re.IGNORECASE).strip()
     return txt
-
 
 # ---------------------------------------------------------
 # STATE
@@ -357,97 +156,89 @@ class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     project_name: Optional[str]
 
-
 # ---------------------------------------------------------
-# CHAT NODE (STREAMING)
+# HYBRID CHAT NODE
 # ---------------------------------------------------------
-
-def docs_contain_ticket_metrics(docs: list[dict]) -> bool:
-    """
-    Returns True only if docs appear to contain ticket counts / metrics.
-    """
-    for d in docs:
-        text = d.get("chunk", "").lower()
-
-        # keywords that MUST exist
-        keywords = ["ticket", "incident", "service request", "count", "total"]
-
-        if any(k in text for k in keywords):
-            # also expect some number
-            if re.search(r"\b\d+\b", text):
-                return True
-
-    return False
 
 def chat_node(state: ChatState):
     messages = state["messages"]
-    # project_name = state.get("project_name")
-    project_name = "sewa"
 
-
-    # Find latest user input
+    # last user msg
     user_text = ""
     for m in reversed(messages):
         if isinstance(m, HumanMessage):
             user_text = m.content
             break
 
-    greeting = is_greeting(user_text)
+    # -------------------------------
+    # STEP 1 — EXCEL (BLOB SEMANTIC)
+    # -------------------------------
+    excel_rows = load_excel_texts()
+    excel_match, score = semantic_search_excel(user_text, excel_rows)
 
-    retrieved = retrieve_docs(user_text, project_name, top=3) if (user_text and project_name and not greeting) else []
-    
-    if not greeting and (
-        not retrieved or not docs_contain_ticket_metrics(retrieved)):
-        yield {
-            "messages": [
-                AIMessage(
-                    content=(
-   "The requested information is not available in the current SEWA documents.\n\n"
-                "**Is your issue resolved?**"
-                        )
-                    )
-                ]
-            }
-        return
+    # -------------------------------
+    # STEP 2 — AZURE SEARCH
+    # -------------------------------
+    search_docs = []
+    if not excel_match:
+        search_docs = azure_search(user_text)
 
-    if retrieved:
+    # -------------------------------
+    # PROMPT ROUTING
+    # -------------------------------
+
+    if excel_match:
+        system_prompt = f"""
+You are an enterprise support assistant.
+Answer ONLY from ticket system data.
+
+Source File: {excel_match['filename']}
+Content:
+{excel_match['content']}
+
+User Question: {user_text}
+Answer:
+"""
+        llm_messages = [SystemMessage(content=system_prompt)]
+
+    elif search_docs:
         block = "\n\n".join(
-            f"Source [{i}]\nTitle: {d['title']}\nContent: {d['chunk']}"
-            for i, d in enumerate(retrieved, start=1)
+            f"Title: {d['title']}\nContent: {d['chunk']}"
+            for d in search_docs
         )
-        system_prompt = (
-            "You are an enterprise support assistant. Use retrieved context.\n\n"
-            f"{block}"
-        )
+
+        system_prompt = f"""
+You are an enterprise support assistant.
+Answer using enterprise knowledge base only.
+
+Knowledge Base:
+{block}
+
+User Question: {user_text}
+Answer:
+"""
+        llm_messages = [SystemMessage(content=system_prompt)]
+
     else:
-        system_prompt = (
-        "You are an enterprise assistant.\n"
-        "You must ONLY answer using provided documents.\n"
-        "If the information is not available in the documents, "
-        "respond clearly that the data is not available."
-        )
+        system_prompt = "You are a helpful enterprise assistant."
+        llm_messages = [SystemMessage(content=system_prompt)] + messages
 
-
-    llm_messages = [SystemMessage(content=system_prompt)] + messages
-
-    # Streaming response
+    # -------------------------------
+    # STREAMING
+    # -------------------------------
     partial = ""
-
     for chunk in llm.stream(llm_messages):
         token = chunk.content or ""
         partial += token
         yield {"messages": [AIMessage(content=token)]}
 
-    # cleaned = sanitize_ai_response(partial, user_text)
+    cleaned = sanitize_ai_response(partial, user_text)
+    cleaned += "\n\n**Is your issue resolved?**"
 
-    # if not greeting:
-    #     cleaned += "\n\n**Is your issue resolved?**"
-
-    # yield {"messages": [AIMessage(content=cleaned)]}
-
+    yield {"messages": [AIMessage(content=cleaned)]}
 
 # ---------------------------------------------------------
-# GRAPH + CHECKPOINT
+# GRAPH
 # ---------------------------------------------------------
 
 conn = sqlite3.connect("chatbot.db", check_same_thread=False)
@@ -460,6 +251,22 @@ graph.add_edge("chat_node", END)
 
 chatbot = graph.compile(checkpointer=checkpointer)
 
-__all__ = ["chatbot"]
+# ---------------------------------------------------------
+# MEMORY STORE
+# ---------------------------------------------------------
 
+_in_memory_threads = {}
 
+def store_message(thread_id: str, role: str, content: str):
+    if thread_id not in _in_memory_threads:
+        _in_memory_threads[thread_id] = []
+    _in_memory_threads[thread_id].append({"role": role, "content": content})
+
+def load_memory(thread_id: str):
+    return _in_memory_threads.get(thread_id, [])
+
+def clear_memory(thread_id: str):
+    if thread_id in _in_memory_threads:
+        del _in_memory_threads[thread_id]
+
+__all__ = ["chatbot", "store_message", "load_memory", "clear_memory"]
