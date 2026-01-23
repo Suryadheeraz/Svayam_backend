@@ -29,5 +29,6 @@ langgraph-checkpoint-sqlite==2.0.11
 azure-core==1.35.0
 azure-storage-blob==12.19.1
 azure-search-documents==11.6.0
+azure-cosmos==4.9.0
 
 openai==1.98.0
