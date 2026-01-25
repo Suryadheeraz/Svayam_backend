@@ -1,5 +1,5 @@
 
-import os, io, re, sqlite3
+import os, io, re, sqlite3, json
 from typing import TypedDict, Annotated, Optional
 from pathlib import Path
 
@@ -36,6 +36,17 @@ SEARCH_INDEX = "svayam-ams-sewa"
 EXCEL_SIM_THRESHOLD = 0.78
 AZURE_SEARCH_MIN_SCORE = 0.65   # strict filter
 
+# Conversation context configuration
+CTX_MAX_TURNS = 6         # look back up to 6 messages (3 user+assistant pairs)
+CTX_MAX_CHARS = 900       # keep contextual query compact for embedding/search
+CTX_STRIP_PATTERNS = [
+    r"^⏳.*$",                      # status tokens like "Processing..."
+    r"^\*\*is your issue resolved\?\*\*$",  # closing line
+]
+
+# Running summary constraints
+SUMMARY_MAX_WORDS = 120
+
 # ---------------------------------------------------------
 # LLM CONFIG
 # ---------------------------------------------------------
@@ -71,6 +82,7 @@ openai_client = AzureOpenAI(
 blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
 container_client = blob_service.get_container_client(CONTAINER_NAME)
 
+# NOTE: AzureKeyCredential requires a valid key set in env
 search_client = SearchClient(
     endpoint=AZURE_SEARCH_ENDPOINT,
     index_name=SEARCH_INDEX,
@@ -105,40 +117,188 @@ def sanitize_ai_response(raw: str, user_text: str):
     txt = re.sub(r"^(as an ai|you asked|your question).*?(\.|:|\n)", "", txt, flags=re.IGNORECASE).strip()
     return txt
 
-# ---------------------------------------------------------
-# REFERENCE APPEND DECISION
-# ---------------------------------------------------------
+def _strip_trivial_lines(text: str) -> str:
+    if not text:
+        return ""
+    t = text.strip()
+    for pat in CTX_STRIP_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return ""
+    return t
 
-_NO_INFO_PATTERNS = [
-    r"\b(i\s*don'?t\s*(?:find|see|have)|cannot\s*(?:find|locate)|can't\s*(?:find|locate))\b",
-    r"\b(no\s+(?:relevant|related)\s+(?:info|information|data|results))\b",
-    r"\b(not\s+(?:found|available|present|in\s+(?:the\s+)?kb|in\s+(?:the\s+)?knowledge\s+base))\b",
-    r"\b(i\s*(?:do\s+not|don't)\s*(?:know|have enough information))\b",
-    r"\b(unable\s+to\s+(?:find|locate|answer|determine))\b",
-    r"\b(out\s+of\s+scope|not\s+in\s+scope)\b",
-    r"\b(no\s+match(?:es)?|no\s+matching\s+results)\b",
-    r"\b(i\s+can\s+only\s+provide\s+information\s+based\s+on\s+the\s+provided\s+knowledge\s+base)\b"
-]
-
-def should_add_references(answer_text: str) -> bool:
+def build_history_text(messages: list[BaseMessage], max_turns: int = CTX_MAX_TURNS, max_chars: int = CTX_MAX_CHARS) -> str:
     """
-    Heuristic to decide whether to append references/sources.
-    If the answer looks like a 'no info / not found' response, return False.
-    Otherwise True.
+    Build a compact conversation history: last N messages (excluding system),
+    cleaned of trivial/status lines, clipped to max_chars.
+    """
+    collected = []
+    count = 0
+    for m in reversed(messages):
+        if isinstance(m, SystemMessage):
+            continue
+        role = "User" if isinstance(m, HumanMessage) else "Assistant"
+        content = _strip_trivial_lines(m.content or "")
+        if not content:
+            continue
+        collected.append(f"{role}: {content}")
+        count += 1
+        if count >= max_turns:
+            break
+    # reverse back to chronological order
+    collected = list(reversed(collected))
+    history = "\n".join(collected)
+    if len(history) > max_chars:
+        history = history[-max_chars:]  # keep tail where most recent context is
+    return history
+
+def build_contextual_query(user_text: str, history_text: str, running_summary: str | None, max_chars: int = CTX_MAX_CHARS) -> str:
+    """
+    Build the context-aware query for retrieval (embeddings + Azure Search).
+    """
+    parts = []
+    if running_summary:
+        parts.append("Running Summary:\n" + running_summary.strip())
+    if history_text:
+        parts.append("Recent Messages:\n" + history_text.strip())
+    parts.append("Current user question:\n" + user_text.strip())
+
+    base = "\n\n".join(parts).strip()
+    if len(base) > max_chars:
+        base = base[-max_chars:]
+    return base
+
+# ---------------------------------------------------------
+# RUNNING SUMMARY (SQLite)
+# ---------------------------------------------------------
+
+def init_summary_store(conn: sqlite3.Connection):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS thread_summaries (
+            thread_id TEXT PRIMARY KEY,
+            summary   TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+
+def get_thread_summary(conn: sqlite3.Connection, thread_id: str) -> str:
+    if not thread_id:
+        return ""
+    row = conn.execute("SELECT summary FROM thread_summaries WHERE thread_id = ?", (thread_id,)).fetchone()
+    return row[0] if row else ""
+
+def upsert_thread_summary(conn: sqlite3.Connection, thread_id: str, summary: str):
+    if not thread_id:
+        return
+    conn.execute("""
+        INSERT INTO thread_summaries (thread_id, summary)
+        VALUES (?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            summary = excluded.summary,
+            updated_at = CURRENT_TIMESTAMP
+    """, (thread_id, summary))
+    conn.commit()
+
+def update_running_summary(
+    thread_id: Optional[str],
+    conn: sqlite3.Connection,
+    prev_summary: str,
+    last_user: str,
+    last_assistant: str
+):
+    """
+    Update the running summary using the previous summary + last turn.
+    Keeps it concise and accumulative.
+    """
+    if not thread_id:
+        return  # cannot persist without a thread id
+
+    sys = (
+        "Update the running summary of a dialogue given the previous summary and the latest turn. "
+        f"Keep it concise (<= {SUMMARY_MAX_WORDS} words), factual, and useful for future retrieval. "
+        "Capture key entities, user goals/requests, steps taken, decisions, and any unresolved items. "
+        "Return ONLY the updated summary text without any prefix/suffix."
+    )
+    hm = (
+        f"PREVIOUS SUMMARY:\n{prev_summary or '(none)'}\n\n"
+        f"LATEST TURN:\nUser: {last_user}\nAssistant: {last_assistant}\n\n"
+        "UPDATED SUMMARY:"
+    )
+    try:
+        resp = llm_intent.invoke([SystemMessage(content=sys), HumanMessage(content=hm)])
+        new_summary = (resp.content or "").strip()
+        upsert_thread_summary(conn, thread_id, new_summary)
+    except Exception as e:
+        # fail quietly; do not break the chat on summarization errors
+        pass
+
+# ---------------------------------------------------------
+# LLM ANSWER VERIFIER
+# ---------------------------------------------------------
+
+_VERIFY_SYSTEM = (
+    "You are a strict answer verifier. "
+    "Given the user's question and the model's answer, classify whether the answer is a "
+    "substantive, on-topic answer ('ANSWER') or a refusal/deflection/out-of-scope/not-found ('NO_ANSWER'). "
+    "Do not be lenient. If the answer apologizes, says it cannot provide information, "
+    "lacks concrete content relevant to the question, or states limitations (e.g., no real-time data), label 'NO_ANSWER'. "
+    "If the answer includes concrete, relevant content that addresses the question, label 'ANSWER'. "
+    "Return only compact JSON with keys: answer_status ('ANSWER'|'NO_ANSWER'), reason (short)."
+)
+
+def verify_answer_with_llm(question: str, answer: str, kb_excerpt: str = "") -> dict:
+    """
+    Uses a small LLM call (non-streaming) to classify the answer as ANSWER or NO_ANSWER.
+    Returns a dict: { 'answer_status': 'ANSWER'|'NO_ANSWER', 'reason': '...' }
+    Falls back to a safe default (NO_ANSWER) if parsing fails.
+    """
+    try:
+        prompt = [
+            SystemMessage(content=_VERIFY_SYSTEM),
+            HumanMessage(content=(
+                "USER_QUESTION:\n"
+                f"{question}\n\n"
+                "MODEL_ANSWER:\n"
+                f"{answer}\n\n"
+                "OPTIONAL_KB_EXCERPT (may be empty):\n"
+                f"{kb_excerpt}\n\n"
+                "Respond with JSON only."
+            ))
+        ]
+        resp = llm_intent.invoke(prompt)
+        raw = (resp.content or "").strip()
+        raw = raw.strip("` \n\t")
+        if raw.startswith("{") and raw.endswith("}"):
+            parsed = json.loads(raw)
+        else:
+            m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            parsed = json.loads(m.group(0)) if m else {}
+
+        status = (parsed.get("answer_status") or "").strip().upper()
+        reason = (parsed.get("reason") or "").strip()
+        if status not in ("ANSWER", "NO_ANSWER"):
+            return {"answer_status": "NO_ANSWER", "reason": "Invalid verifier status"}
+        return {"answer_status": status, "reason": reason or "n/a"}
+    except Exception as e:
+        return {"answer_status": "NO_ANSWER", "reason": f"Verifier error: {e}"}
+
+def heuristic_noinfo(answer_text: str) -> bool:
+    """
+    Minimal conservative fallback in case verifier fails.
     """
     if not answer_text:
-        return False
-
-    text = answer_text.strip().lower()
-    for pat in _NO_INFO_PATTERNS:
-        if re.search(pat, text):
-            return False
-
-    # Avoid references on extremely short / generic replies
-    if len(text) < 30:
-        return False
-
-    return True
+        return True
+    t = answer_text.strip().lower()
+    if len(t) < 40:
+        return True
+    if any(p in t for p in [
+        "i'm sorry", "sorry", "cannot provide", "can't provide",
+        "i do not have", "i don't have", "out of scope",
+        "outside the knowledge base", "not related to the knowledge base",
+        "i can only provide information based on", "unable to answer"
+    ]):
+        return True
+    return False
 
 # ---------------------------------------------------------
 # GREETING
@@ -147,7 +307,7 @@ def should_add_references(answer_text: str) -> bool:
 def llm_is_greeting(text: str) -> bool:
     try:
         prompt = [
-            SystemMessage(content="Reply only with GREETING or ⏳ Processing..."),
+            SystemMessage(content="Reply only with GREETING or QUERY_PROCESSING"),
             HumanMessage(content=f'Message: "{text}"')
         ]
         resp = llm_intent.invoke(prompt)
@@ -185,8 +345,11 @@ def load_excel_texts():
 # EXCEL SEMANTIC SEARCH
 # ---------------------------------------------------------
 
-def semantic_search_excel(question, excel_rows):
-    q_emb = get_embedding(question)
+def semantic_search_excel(context_query: str, excel_rows):
+    """
+    Use the context-aware query (with running summary + chat history) for embeddings similarity.
+    """
+    q_emb = get_embedding(context_query)
 
     best_match = None
     best_score = 0
@@ -209,6 +372,7 @@ def semantic_search_excel(question, excel_rows):
 # ---------------------------------------------------------
 
 def azure_search(query: str, top: int = 5):
+    # Pass the context-aware query directly
     results = search_client.search(search_text=query, top=top)
     docs = []
     for r in results:
@@ -230,6 +394,8 @@ def azure_search(query: str, top: int = 5):
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     project_name: Optional[str]
+    # NEW: carry thread_id in state so we can persist and retrieve running summary
+    thread_id: Optional[str]
 
 # ---------------------------------------------------------
 # CHAT NODE
@@ -237,12 +403,13 @@ class ChatState(TypedDict):
 
 def chat_node(state: ChatState):
     messages = state["messages"]
+    thread_id = state.get("thread_id")
 
     # last user msg
     user_text = ""
     for m in reversed(messages):
         if isinstance(m, HumanMessage):
-            user_text = m.content.strip()
+            user_text = (m.content or "").strip()
             break
 
     # ---------- GREETING ----------
@@ -252,18 +419,32 @@ def chat_node(state: ChatState):
 
     yield {"messages": [AIMessage(content="⏳ Processing your request...")]}
 
+    # ---------- Build context-aware query ----------
+    history_text = build_history_text(messages, CTX_MAX_TURNS, CTX_MAX_CHARS)
+    prev_summary = get_thread_summary(conn, thread_id) if thread_id else ""
+    context_query = build_contextual_query(user_text, history_text, prev_summary, CTX_MAX_CHARS)
+
     # ---------- EXCEL ----------
     excel_rows = load_excel_texts()
-    excel_match, excel_score = semantic_search_excel(user_text, excel_rows)
+    excel_match, excel_score = semantic_search_excel(context_query, excel_rows)
 
     # ===== CASE 1: EXCEL =====
     if excel_match:
         system_prompt = f"""
-Answer ONLY from this data:
+You are answering with the help of structured Excel row data. Use the running summary and conversation context to resolve pronouns and maintain continuity.
 
+Running Summary:
+{prev_summary or '(none)'}
+
+Conversation Context:
+{history_text}
+
+Answer ONLY from this data (do not invent):
 {excel_match['content']}
 
-User Question: {user_text}
+User Question:
+{user_text}
+
 Answer:
 """
         llm_messages = [SystemMessage(content=system_prompt)]
@@ -276,17 +457,29 @@ Answer:
 
         cleaned = sanitize_ai_response(partial, user_text)
 
-        # Only add source if the answer looks confident/relevant
-        if should_add_references(cleaned):
+        # ---- LLM verification ----
+        verdict = verify_answer_with_llm(
+            question=user_text,
+            answer=cleaned,
+            kb_excerpt=excel_match["content"]
+        )
+        add_refs = (verdict.get("answer_status") == "ANSWER")
+        if not add_refs and not heuristic_noinfo(cleaned):
+            pass
+
+        if add_refs:
             cleaned += f"\n\n📄 **Source:** `{excel_match['filename']}`"
 
         cleaned += "\n\n**Is your issue resolved?**"
+
+        # ---- Update running summary with last turn ----
+        update_running_summary(thread_id, conn, prev_summary, user_text, cleaned)
 
         yield {"messages": [AIMessage(content=cleaned)]}
         return
 
     # ---------- AI SEARCH ----------
-    raw_docs = azure_search(user_text)
+    raw_docs = azure_search(context_query)
 
     search_docs = [
         d for d in raw_docs
@@ -300,11 +493,21 @@ Answer:
         block = "\n\n".join(d["chunk"] for d in search_docs)
 
         system_prompt = f"""
-Answer ONLY from this knowledge base:
+You are answering from the internal knowledge base. Use the running summary and conversation context to resolve pronouns and maintain continuity.
+If the answer is not present in the provided snippets, say you do not have that information.
 
+Running Summary:
+{prev_summary or '(none)'}
+
+Conversation Context:
+{history_text}
+
+Knowledge Base Snippets (authoritative):
 {block}
 
-User Question: {user_text}
+User Question:
+{user_text}
+
 Answer:
 """
         llm_messages = [SystemMessage(content=system_prompt)]
@@ -317,11 +520,23 @@ Answer:
 
         cleaned = sanitize_ai_response(partial, user_text)
 
-        # Only add references if the answer looks confident/relevant
-        if should_add_references(cleaned):
+        # ---- LLM verification ----
+        verdict = verify_answer_with_llm(
+            question=user_text,
+            answer=cleaned,
+            kb_excerpt=block
+        )
+        add_refs = (verdict.get("answer_status") == "ANSWER")
+        if not add_refs and not heuristic_noinfo(cleaned):
+            pass
+
+        if add_refs:
             cleaned += f"\n\n📚 **References:** {', '.join(refs)}"
 
         cleaned += "\n\n**Is your issue resolved?**"
+
+        # ---- Update running summary with last turn ----
+        update_running_summary(thread_id, conn, prev_summary, user_text, cleaned)
 
         yield {"messages": [AIMessage(content=cleaned)]}
         return
@@ -332,6 +547,10 @@ Answer:
         "If you have questions related to the project content, feel free to ask!"
         "\n\n**Is your issue resolved?**"
     )
+
+    # ---- Update running summary (even for 'not found' helps continuity) ----
+    update_running_summary(thread_id, conn, prev_summary, user_text, cleaned)
+
     yield {"messages": [AIMessage(content=cleaned)]}
 
 # ---------------------------------------------------------
@@ -340,6 +559,7 @@ Answer:
 
 conn = sqlite3.connect("chatbot.db", check_same_thread=False)
 checkpointer = SqliteSaver(conn=conn)
+init_summary_store(conn)  # ensure the summary table exists
 
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
@@ -349,7 +569,7 @@ graph.add_edge("chat_node", END)
 chatbot = graph.compile(checkpointer=checkpointer)
 
 # ---------------------------------------------------------
-# MEMORY STORE
+# MEMORY STORE (UI-only helper)
 # ---------------------------------------------------------
 
 _in_memory_threads = {}

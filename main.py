@@ -4810,6 +4810,29 @@ def logout(current_user: User = Depends(get_current_user), db: Session = Depends
     db.commit()
     return {"message": "Logged out"}
 
+@app.post("/refresh")
+def refresh_token(payload: dict, db: Session = Depends(get_db)):
+    refresh_token_value = payload.get("refresh_token")
+
+    rt = db.query(RefreshToken).filter(
+        RefreshToken.token == refresh_token_value,
+        RefreshToken.expires_at > datetime.utcnow()
+    ).first()
+
+    if not rt:
+        raise HTTPException(401, "Invalid refresh token")
+
+    user = db.query(User).filter(User.id == rt.user_id).first()
+    if not user:
+        raise HTTPException(401, "User not found")
+
+    access_token = create_access_token(
+        {"sub": str(user.id), "email": user.email}
+    )
+
+    return {"access_token": access_token}
+
+
 # -------------------------------------------------------------------------
 # Projects
 # -------------------------------------------------------------------------
