@@ -494,25 +494,13 @@ OPENAI_EMBEDDING_DEPLOYMENT = "text-embedding-3-large"
 
 CONTAINER_NAME = "svayamams" # Default container
 
+if not all([AZURE_STORAGE_CONN_STR, SEARCH_SERVICE_ENDPOINT, SEARCH_ADMIN_KEY]):
+    raise ValueError("Missing Azure configuration in .env file.")
 
 # Initialize Clients
-def get_blob_service_client():
-    conn = os.getenv("AZURE_STORAGE_CONN_STR")
-    if not conn:
-        raise HTTPException(500, "AZURE_STORAGE_CONN_STR missing")
-    return BlobServiceClient.from_connection_string(conn)
-def get_search_index_client():
-    return SearchIndexClient(
-        os.getenv("SEARCH_SERVICE"),
-        AzureKeyCredential(os.getenv("SEARCH_KEY"))
-    )
-
-def get_search_indexer_client():
-    return SearchIndexerClient(
-        os.getenv("SEARCH_SERVICE"),
-        AzureKeyCredential(os.getenv("SEARCH_KEY"))
-    )
-
+blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONN_STR)
+search_index_client = SearchIndexClient(SEARCH_SERVICE_ENDPOINT, AzureKeyCredential(SEARCH_ADMIN_KEY))
+search_indexer_client = SearchIndexerClient(SEARCH_SERVICE_ENDPOINT, AzureKeyCredential(SEARCH_ADMIN_KEY))
 
 print(f"✅ Knowledge Base API initialized.")
 
@@ -524,7 +512,7 @@ class CreateProjectRequest(BaseModel):
 def get_container_client_for_project(project_name: Optional[str] = None):
     target_container = project_name if project_name else CONTAINER_NAME
     try:
-        return get_blob_service_client().get_container_client(target_container)
+        return blob_service_client.get_container_client(target_container)
     except Exception:
         raise HTTPException(404, f"Project container '{target_container}' not found.")
 
@@ -538,19 +526,19 @@ def cleanup_project_resources(project_name: str):
     skillset_name = f"{index_name}-skillset"
 
     try: 
-        get_search_indexer_client().delete_indexer(indexer_name)
+        search_indexer_client.delete_indexer(indexer_name)
         print(f"Deleted Indexer: {indexer_name}")
     except: 
         pass
     
     try: 
-        get_search_indexer_client().delete_data_source_connection(datasource_name)
+        search_indexer_client.delete_data_source_connection(datasource_name)
         print(f"Deleted DataSource: {datasource_name}")
     except: 
         pass
     
     try: 
-        get_search_indexer_client().delete_skillset(skillset_name)
+        search_indexer_client.delete_skillset(skillset_name)
         print(f"Deleted Skillset: {skillset_name}")
     except: 
         pass
@@ -601,7 +589,7 @@ def sync_projects_with_storage(
     """
     try:
         # 1. Get all containers from Azure Blob Storage
-        containers = get_blob_service_client().list_containers()
+        containers = blob_service_client.list_containers()
         blob_container_names = set()
         
         # for container in containers:
@@ -694,7 +682,7 @@ def create_new_project(
     
     # Check if container already exists in AZURE
     try:
-        container_client = get_blob_service_client().get_container_client(project_name)
+        container_client = blob_service_client.get_container_client(project_name)
         if container_client.exists():
             raise HTTPException(400, f"Project '{project_name}' already exists in Azure Storage.")
     except Exception as e:
@@ -723,7 +711,7 @@ def create_new_project(
         # STEP 1: CREATE AZURE BLOB STORAGE CONTAINER
         # ============================================================
         print(f"📦 Creating container: {project_name}")
-        get_blob_service_client().create_container(project_name)
+        blob_service_client.create_container(project_name)
         created_container = True
         print(f"✅ Container created: {project_name}")
 
@@ -854,7 +842,7 @@ def create_new_project(
             index_projection=index_projections,
             description="Skillset to chunk documents and generate embeddings"
         )
-        get_search_indexer_client().create_or_update_skillset(skillset)
+        search_indexer_client.create_or_update_skillset(skillset)
         created_skillset = True
         print(f"✅ Skillset created: {skillset_name}")
 
@@ -873,7 +861,7 @@ def create_new_project(
                  "mappingFunction": {"name": "base64Encode"}}
             ]
         )
-        get_search_indexer_client().create_or_update_indexer(indexer)
+        search_indexer_client.create_or_update_indexer(indexer)
         created_indexer = True
         print(f"✅ Indexer created: {indexer_name}")
 
@@ -931,7 +919,7 @@ def create_new_project(
         # Rollback Indexer
         if created_indexer:
             try:
-                get_search_indexer_client().delete_indexer(indexer_name)
+                search_indexer_client.delete_indexer(indexer_name)
                 print(f"   ✓ Deleted indexer: {indexer_name}")
             except Exception as cleanup_err:
                 print(f"   ✗ Failed to delete indexer: {cleanup_err}")
@@ -939,7 +927,7 @@ def create_new_project(
         # Rollback Skillset
         if created_skillset:
             try:
-                get_search_indexer_client().delete_skillset(skillset_name)
+                search_indexer_client.delete_skillset(skillset_name)
                 print(f"   ✓ Deleted skillset: {skillset_name}")
             except Exception as cleanup_err:
                 print(f"   ✗ Failed to delete skillset: {cleanup_err}")
@@ -955,7 +943,7 @@ def create_new_project(
         # Rollback Data Source
         if created_datasource:
             try:
-                get_search_indexer_client().delete_data_source_connection(datasource_name)
+                search_indexer_client.delete_data_source_connection(datasource_name)
                 print(f"   ✓ Deleted data source: {datasource_name}")
             except Exception as cleanup_err:
                 print(f"   ✗ Failed to delete data source: {cleanup_err}")
@@ -963,7 +951,7 @@ def create_new_project(
         # Rollback Container
         if created_container:
             try:
-                get_blob_service_client().delete_container(project_name)
+                blob_service_client.delete_container(project_name)
                 print(f"   ✓ Deleted container: {project_name}")
             except Exception as cleanup_err:
                 print(f"   ✗ Failed to delete container: {cleanup_err}")
@@ -990,7 +978,7 @@ def list_containers(user: User = Depends(get_current_user), db: Session = Depend
         db_project_names = {p.name for p in db_projects}
         
         # Get containers from Azure
-        containers = get_blob_service_client().list_containers()
+        containers = blob_service_client.list_containers()
         blob_container_names = set()
         
         for container in containers:
@@ -1053,7 +1041,7 @@ def validate_projects(admin: User = Depends(get_current_admin_user), db: Session
         db_names = set(db_project_map.keys())
         
         # Get containers from Azure
-        containers = get_blob_service_client().list_containers()
+        containers = blob_service_client.list_containers()
         azure_names = set()
         
         for container in containers:
@@ -1071,7 +1059,7 @@ def validate_projects(admin: User = Depends(get_current_admin_user), db: Session
         for project_name in in_sync:
             index_name = f"svayam-ams-{project_name}"
             try:
-                get_search_index_client().get_index(index_name)
+                search_index_client.get_index(index_name)
                 status = "healthy"
             except:
                 status = "missing_search_resources"
@@ -1118,7 +1106,7 @@ def get_project_status(
         db_exists = project is not None
         
         # Check Azure Blob Storage
-        container_client = get_blob_service_client().get_container_client(project_name)
+        container_client = blob_service_client.get_container_client(project_name)
         try:
             container_exists = container_client.exists()
             if container_exists:
@@ -1145,25 +1133,25 @@ def get_project_status(
         }
         
         try:
-            get_search_index_client().get_index(index_name)
+            search_index_client.get_index(index_name)
             search_resources["index"] = True
         except:
             pass
         
         try:
-            get_search_indexer_client().get_indexer(indexer_name)
+            search_indexer_client.get_indexer(indexer_name)
             search_resources["indexer"] = True
         except:
             pass
         
         try:
-            get_search_indexer_client().get_data_source_connection(datasource_name)
+            search_indexer_client.get_data_source_connection(datasource_name)
             search_resources["datasource"] = True
         except:
             pass
         
         try:
-            get_search_indexer_client().get_skillset(skillset_name)
+            search_indexer_client.get_skillset(skillset_name)
             search_resources["skillset"] = True
         except:
             pass
@@ -1237,7 +1225,7 @@ def get_dl_url(blob_name: str = Query(..., min_length=1), project: Optional[str]
     client = get_container_client_for_project(project)
     if not client.get_blob_client(blob_name).exists(): 
         raise HTTPException(404, "File not found")
-    sas = generate_blob_sas(account_name=client.account_name, container_name=client.container_name, blob_name=blob_name, account_key=get_blob_service_client().credential.account_key, permission=BlobSasPermissions(read=True), start=datetime.now(timezone.utc)-timedelta(minutes=5), expiry=datetime.now(timezone.utc)+timedelta(hours=1))
+    sas = generate_blob_sas(account_name=client.account_name, container_name=client.container_name, blob_name=blob_name, account_key=blob_service_client.credential.account_key, permission=BlobSasPermissions(read=True), start=datetime.now(timezone.utc)-timedelta(minutes=5), expiry=datetime.now(timezone.utc)+timedelta(hours=1))
     return {"url": f"https://{client.account_name}.blob.core.windows.net/{client.container_name}/{blob_name}?{sas}"}
 
 @router.post("/upload-files", response_model=List[Dict[str, Any]])
@@ -1257,7 +1245,7 @@ async def upload(files: List[UploadFile] = File(...), destination_folder: str = 
         del kb_cache[project_key]
     
     if project_name:
-        try: get_search_indexer_client().run_indexer(f"svayam-ams-{project_name}-indexer")
+        try: search_indexer_client.run_indexer(f"svayam-ams-{project_name}-indexer")
         except: pass
     return res
 
@@ -1280,7 +1268,7 @@ def delete_item(item: DeleteItemRequest, admin: User = Depends(get_current_admin
         
         # Then cleanup Azure resources
         cleanup_project_resources(target_project)
-        try: get_blob_service_client().delete_container(target_project)
+        try: blob_service_client.delete_container(target_project)
         except: pass
         
         # Clear cache
