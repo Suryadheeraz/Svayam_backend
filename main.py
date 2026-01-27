@@ -5177,26 +5177,82 @@ except Exception:
     Client = None
     logger.info("LangSmith client not installed; analytics endpoint will return default values")
 
+# @app.get("/api/admin/analytics")
+# def get_analytics(current_user=Depends(get_current_user)):
+#     if current_user.role != "admin":
+#         raise HTTPException(status_code=403, detail="Not authorized")
+#     if Client is None:
+#         return {"total_requests": 0, "total_tokens": 0, "total_cost": 0, "avg_latency": 0, "daily_trends": []}
+#     try:
+#         client = Client()
+#         project_name = os.getenv("LANGCHAIN_PROJECT", "svayam-chatbot-prod")
+#         runs = list(client.list_runs(project_name=project_name, is_root=True, start_time=datetime.now() - timedelta(days=7)))
+#     except Exception as e:
+#         logger.error(f"LangSmith Connection Error: {e}")
+#         return {"total_requests": 0, "total_tokens": 0, "total_cost": 0, "avg_latency": 0, "daily_trends": []}
+
+#     total_runs = len(runs)
+#     total_tokens = 0
+#     total_cost = 0.0
+#     total_latency = 0.0
+
+#     daily_map: DefaultDict[str, Dict] = defaultdict(lambda: {"requests": 0, "tokens": 0, "cost": 0.0, "latency_sum": 0.0})
+#     for run in runs:
+#         date_str = run.start_time.strftime("%Y-%m-%d")
+#         daily_map[date_str]["requests"] += 1
+#         tokens = getattr(run, "total_tokens", 0) or 0
+#         total_tokens += tokens
+#         daily_map[date_str]["tokens"] += tokens
+#         cost = float(getattr(run, "total_cost", 0) or 0)
+#         total_cost += cost
+#         daily_map[date_str]["cost"] += cost
+#         if run.end_time and run.start_time:
+#             latency = (run.end_time - run.start_time).total_seconds()
+#             total_latency += latency
+#             daily_map[date_str]["latency_sum"] += latency
+
+#     avg_latency = (total_latency / total_runs) if total_runs > 0 else 0
+#     daily_trends = []
+#     for i in range(6, -1, -1):
+#         day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+#         stats = daily_map.get(day, {"requests": 0, "tokens": 0, "cost": 0.0, "latency_sum": 0.0})
+#         daily_avg_latency = (stats["latency_sum"] / stats["requests"]) if stats["requests"] > 0 else 0
+#         daily_trends.append({"date": day, "requests": stats["requests"], "tokens": stats["tokens"], "cost": round(stats["cost"], 4), "avg_latency": round(daily_avg_latency, 2)})
+
+#     return {"total_requests": total_runs, "total_tokens": total_tokens, "total_cost": round(total_cost, 4), "avg_latency": round(avg_latency, 2), "daily_trends": daily_trends}
+
+
+
 @app.get("/api/admin/analytics")
 def get_analytics(current_user=Depends(get_current_user)):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
     if Client is None:
-        return {"total_requests": 0, "total_tokens": 0, "total_cost": 0, "avg_latency": 0, "daily_trends": []}
+        return {"total_requests": 0, "total_llm_calls": 0, "total_tokens": 0, "total_cost": 0, "avg_latency": 0, "daily_trends": []}
     try:
         client = Client()
         project_name = os.getenv("LANGCHAIN_PROJECT", "svayam-chatbot-prod")
+ 
+        seven_days_ago = datetime.now() - timedelta(days=7)
+ 
         runs = list(client.list_runs(project_name=project_name, is_root=True, start_time=datetime.now() - timedelta(days=7)))
+        # 2. Get Specific LLM Calls (Actual GPT-4o invocations)
+        llm_runs = list(client.list_runs(
+            project_name=project_name,
+            run_type="llm",  # <--- Filters for ONLY model calls
+            start_time=seven_days_ago
+        ))
     except Exception as e:
         logger.error(f"LangSmith Connection Error: {e}")
         return {"total_requests": 0, "total_tokens": 0, "total_cost": 0, "avg_latency": 0, "daily_trends": []}
-
+ 
     total_runs = len(runs)
+    total_llm_calls = len(llm_runs) # <--- NEW METRIC
     total_tokens = 0
     total_cost = 0.0
     total_latency = 0.0
-
-    daily_map: DefaultDict[str, Dict] = defaultdict(lambda: {"requests": 0, "tokens": 0, "cost": 0.0, "latency_sum": 0.0})
+ 
+    daily_map: DefaultDict[str, Dict] = defaultdict(lambda: {"requests": 0, "llm_calls": 0, "tokens": 0, "cost": 0.0, "latency_sum": 0.0})
     for run in runs:
         date_str = run.start_time.strftime("%Y-%m-%d")
         daily_map[date_str]["requests"] += 1
@@ -5210,17 +5266,22 @@ def get_analytics(current_user=Depends(get_current_user)):
             latency = (run.end_time - run.start_time).total_seconds()
             total_latency += latency
             daily_map[date_str]["latency_sum"] += latency
-
+ 
+    # Process LLM Runs (just to count daily LLM invocations)
+    for run in llm_runs:
+        day = run.start_time.strftime("%Y-%m-%d")
+        daily_map[day]["llm_calls"] += 1
+   
     avg_latency = (total_latency / total_runs) if total_runs > 0 else 0
     daily_trends = []
     for i in range(6, -1, -1):
         day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
-        stats = daily_map.get(day, {"requests": 0, "tokens": 0, "cost": 0.0, "latency_sum": 0.0})
+        stats = daily_map.get(day, {"requests": 0, "llm_calls": 0, "tokens": 0, "cost": 0.0, "latency_sum": 0.0})
         daily_avg_latency = (stats["latency_sum"] / stats["requests"]) if stats["requests"] > 0 else 0
-        daily_trends.append({"date": day, "requests": stats["requests"], "tokens": stats["tokens"], "cost": round(stats["cost"], 4), "avg_latency": round(daily_avg_latency, 2)})
-
-    return {"total_requests": total_runs, "total_tokens": total_tokens, "total_cost": round(total_cost, 4), "avg_latency": round(avg_latency, 2), "daily_trends": daily_trends}
-
+        daily_trends.append({"date": day, "requests": stats["requests"], "llm_calls": stats["llm_calls"], "tokens": stats["tokens"], "cost": round(stats["cost"], 4), "avg_latency": round(daily_avg_latency, 2)})
+ 
+    return {"total_requests": total_runs, "total_llm_calls": total_llm_calls, "total_tokens": total_tokens, "total_cost": round(total_cost, 4), "avg_latency": round(avg_latency, 2), "daily_trends": daily_trends}
+ 
 # Entrypoint guard for Uvicorn
 if __name__ == "__main__":
     import uvicorn
