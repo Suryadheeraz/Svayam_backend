@@ -4770,11 +4770,15 @@ def get_current_admin_user(current_user: User = Depends(get_current_user)) -> Us
 
 
 # include knowledgebase routes (if exists)
-try:
-    from knowledgebase import router as kb_router
-    app.include_router(kb_router)
-except Exception:
-    logger.info("Knowledgebase router not available")
+# try:
+#     from knowledgebase import router as kb_router
+#     app.include_router(kb_router)
+# except Exception:
+#     logger.info("Knowledgebase router not available")
+
+ 
+from api.knowledgebase import router as kb_router
+app.include_router(kb_router)
 
 # token helpers
 def create_access_token(data: dict, expires_delta: timedelta = None):
