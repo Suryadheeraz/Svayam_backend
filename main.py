@@ -5005,7 +5005,7 @@ def add_message(
     # Title generation background
     if convo.topic == "New Chat":
         msgs = storage_manager.get_messages(conversation_uuid)
-        if len(msgs) >= 4:
+        if len(msgs) == 3:
             async def update_title_task(conv_uuid, message_history):
                 try:
                     text_msgs = [f"{m['role']}: {m['content']}" for m in message_history[:4]]
