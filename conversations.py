@@ -319,7 +319,6 @@ def _get_container():
         container = db.create_container_if_not_exists(
             id=COSMOS_CONTAINER,
             partition_key=PartitionKey(path="/thread_id"),
-            offer_throughput=400
         )
         return container
     except Exception as e:
