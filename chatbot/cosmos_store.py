@@ -753,8 +753,7 @@ def get_container():
     )
     _container = database.create_container_if_not_exists(
         id=COSMOS_CONTAINER,
-        partition_key=PartitionKey(path="/project_name"),
-        offer_throughput=400 
+        partition_key=PartitionKey(path="/project_name")
     )
 
 
