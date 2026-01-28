@@ -727,8 +727,7 @@ def get_cosmos_client() -> CosmosClient:
         _cosmos_client = CosmosClient(
             COSMOS_ENDPOINT,
             COSMOS_KEY,
-            connection_mode="Gateway",
-            request_timeout=10
+            request_timeout=30
         )
 
     return _cosmos_client
@@ -748,7 +747,6 @@ def get_container():
         id=COSMOS_DATABASE,
         request_options={"timeout": 20}
     )
-
     logger.info(
         " Ensuring container exists: %s (partition=/project_name)",
         COSMOS_CONTAINER
@@ -756,8 +754,9 @@ def get_container():
     _container = database.create_container_if_not_exists(
         id=COSMOS_CONTAINER,
         partition_key=PartitionKey(path="/project_name"),
-        request_options={"timeout": 20}
+        offer_throughput=400 
     )
+
 
     logger.info("Cosmos DB & container ready")
     return _container
@@ -918,9 +917,7 @@ def delete_thread(project_name: str, thread_id: str):
 def cosmos_is_available() -> bool:
     try:
         client = get_cosmos_client()
-        client.get_database_client(COSMOS_DATABASE).read(
-            request_options={"timeout": 10}
-        )
+        client.create_database_if_not_exists(id = COSMOS_DATABASE)
         return True
     except Exception as e:
         logger.warning("Cosmos unavailable: %s", str(e))
