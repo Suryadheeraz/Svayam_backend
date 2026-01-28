@@ -727,6 +727,7 @@ def get_cosmos_client() -> CosmosClient:
         _cosmos_client = CosmosClient(
             COSMOS_ENDPOINT,
             COSMOS_KEY,
+            connection_timeout=10,
             request_timeout=30
         )
 
