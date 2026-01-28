@@ -733,7 +733,6 @@ def get_cosmos_client() -> CosmosClient:
     return _cosmos_client
 
 
-
 def get_container():
     global _container
 
@@ -742,23 +741,15 @@ def get_container():
 
     client = get_cosmos_client()
 
-    logger.info("Ensuring database exists: %s", COSMOS_DATABASE)
-    database = client.create_database_if_not_exists(
-        id=COSMOS_DATABASE,
-        request_options={"timeout": 20}
-    )
-    logger.info(
-        " Ensuring container exists: %s (partition=/project_name)",
-        COSMOS_CONTAINER
-    )
-    _container = database.create_container_if_not_exists(
-        id=COSMOS_CONTAINER,
-        partition_key=PartitionKey(path="/project_name")
-    )
-
-
-    logger.info("Cosmos DB & container ready")
-    return _container
+    try:
+        database = client.get_database_client(COSMOS_DATABASE)
+        _container = database.get_container_client(COSMOS_CONTAINER)
+        logger.info("Cosmos DB container connected")
+        return _container
+    except exceptions.CosmosResourceNotFoundError:
+        raise RuntimeError(
+            "Cosmos DB container not found. Create it ONCE in Azure Portal."
+        )
 
 
 
