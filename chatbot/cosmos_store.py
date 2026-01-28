@@ -485,62 +485,297 @@
 #     return _initialization_error is None and _db is not None
 
 # cosmos_store.py
-from azure.cosmos import CosmosClient, PartitionKey, exceptions
-from dotenv import load_dotenv
+# from azure.cosmos import CosmosClient, PartitionKey, exceptions
+# from dotenv import load_dotenv
+# import os
+# from datetime import datetime
+# import uuid
+
+# load_dotenv()
+
+# COSMOS_ENDPOINT = os.getenv("COSMOS_ENDPOINT")
+# COSMOS_KEY = os.getenv("COSMOS_KEY")
+# COSMOS_DATABASE = os.getenv("COSMOS_DATABASE", "svayamams")
+# COSMOS_CONTAINER = os.getenv("COSMOS_CONTAINER", "chat-conversations")
+
+# if not COSMOS_ENDPOINT or not COSMOS_KEY:
+#     raise RuntimeError("COSMOS_ENDPOINT or COSMOS_KEY is not set in environment/.env")
+
+# # Cosmos client
+# # client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
+# _cosmos_client = None
+
+# def get_cosmos_client():
+#     global _cosmos_client
+#     if _cosmos_client is None:
+#         _cosmos_client = CosmosClient(
+#             COSMOS_ENDPOINT,
+#             COSMOS_KEY,
+#             request_timeout=15,      # increase timeout
+#             connection_timeout=15
+#         )
+#     return _cosmos_client
+
+
+# # =====================================================
+# #  Get DB + container (partition key = /project_name)
+# # =====================================================
+# def _get_db_and_container():
+#     client = get_cosmos_client()
+
+#     db = client.create_database_if_not_exists(id=COSMOS_DATABASE)
+#     container = db.create_container_if_not_exists(
+#         id=COSMOS_CONTAINER,
+#         partition_key=PartitionKey(path="/project_name"),   # << IMPORTANT
+#         offer_throughput=400
+#     )
+#     return db, container
+
+
+# # =====================================================
+# #  Append message
+# # =====================================================
+# def append_message(project_name: str, thread_id: str, role: str, content: str, metadata: dict = None):
+#     _, container = _get_db_and_container()
+
+#     msg = {
+#         "id": str(uuid.uuid4()),
+#         "project_name": project_name,      # << partition key
+#         "thread_id": thread_id,
+#         "role": role,
+#         "content": content,
+#         "timestamp": datetime.utcnow().isoformat() + "Z",
+#         "metadata": metadata or {},
+#     }
+
+#     return container.create_item(body=msg)
+
+
+# # =====================================================
+# #  Load messages for a thread (partition-safe)
+# # =====================================================
+# def load_messages(project_name: str, thread_id: str, max_items: int = 1000):
+#     _, container = _get_db_and_container()
+
+#     query = """
+#         SELECT c.id, c.thread_id, c.role, c.content, c.timestamp
+#         FROM c
+#         WHERE c.project_name = @project_name AND c.thread_id = @thread_id
+#         ORDER BY c.timestamp ASC
+#     """
+
+#     params = [
+#         {"name": "@project_name", "value": project_name},
+#         {"name": "@thread_id", "value": thread_id},
+#     ]
+
+#     return list(container.query_items(
+#         query=query,
+#         parameters=params,
+#         enable_cross_partition_query=False,   # works because project_name is the partition
+#         max_item_count=max_items
+#     ))
+
+
+# # =====================================================
+# #  List threads with preview (same project only)
+# # =====================================================
+# def list_threads_with_preview(project_name: str, limit: int = 100):
+#     _, container = _get_db_and_container()
+
+#     top_k = max(limit * 5, 200)
+
+#     query = f"""
+#         SELECT TOP {top_k} c.thread_id, c.content, c.timestamp
+#         FROM c
+#         WHERE c.project_name = @project_name
+#         ORDER BY c.timestamp DESC
+#     """
+
+#     params = [{"name": "@project_name", "value": project_name}]
+
+#     items = list(container.query_items(
+#         query=query,
+#         parameters=params,
+#         enable_cross_partition_query=False
+#     ))
+
+#     seen = set()
+#     results = []
+
+#     for it in items:
+#         tid = it.get("thread_id")
+#         if not tid or tid in seen:
+#             continue
+#         seen.add(tid)
+
+#         preview = (it.get("content") or "")
+#         if len(preview) > 200:
+#             preview = preview[:200] + " ..."
+
+#         results.append({
+#             "thread_id": tid,
+#             "preview": preview,
+#             "timestamp": it.get("timestamp")
+#         })
+
+#         if len(results) >= limit:
+#             break
+
+#     return results
+
+
+# # =====================================================
+# #  Read single message (debug)
+# # =====================================================
+# def read_message(project_name: str, item_id: str):
+#     _, container = _get_db_and_container()
+#     try:
+#         return container.read_item(
+#             item=item_id,
+#             partition_key=project_name
+#         )
+#     except exceptions.CosmosResourceNotFoundError:
+#         return None
+
+
+# # =====================================================
+# #  Delete all messages for a thread (partition-safe)
+# # =====================================================
+# def delete_thread(project_name: str, thread_id: str):
+#     _, container = _get_db_and_container()
+
+#     query = """
+#         SELECT c.id
+#         FROM c
+#         WHERE c.project_name = @project_name AND c.thread_id = @thread_id
+#     """
+
+#     params = [
+#         {"name": "@project_name", "value": project_name},
+#         {"name": "@thread_id", "value": thread_id},
+#     ]
+
+#     items = list(container.query_items(
+#         query=query,
+#         parameters=params,
+#         enable_cross_partition_query=False
+#     ))
+
+#     deleted = 0
+#     for doc in items:
+#         try:
+#             container.delete_item(
+#                 item=doc["id"],
+#                 partition_key=project_name
+#             )
+#             deleted += 1
+#         except Exception as e:
+#             print(f"Error deleting {doc['id']}: {e}")
+
+#     print(f"🗑️ Deleted {deleted} messages from thread {thread_id} in project {project_name}")
+#     return True
+
+
+# # =====================================================
+# #  Cosmos connectivity test
+# # =====================================================
+# _cosmos_available = None
+
+# def cosmos_is_available() -> bool:
+#     client = get_cosmos_client()
+
+#     global _cosmos_available
+
+#     if _cosmos_available is True:
+#         return True
+
+#     try:
+#         client.get_database_client(COSMOS_DATABASE).read()
+#         _cosmos_available = True
+#         return True
+#     except Exception:
+#         _cosmos_available = False
+#         return False
+
 import os
+from azure.cosmos import CosmosClient, PartitionKey, exceptions
+import logging
 from datetime import datetime
 import uuid
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("cosmos")
+
 
 COSMOS_ENDPOINT = os.getenv("COSMOS_ENDPOINT")
 COSMOS_KEY = os.getenv("COSMOS_KEY")
 COSMOS_DATABASE = os.getenv("COSMOS_DATABASE", "svayamams")
 COSMOS_CONTAINER = os.getenv("COSMOS_CONTAINER", "chat-conversations")
 
-if not COSMOS_ENDPOINT or not COSMOS_KEY:
-    raise RuntimeError("COSMOS_ENDPOINT or COSMOS_KEY is not set in environment/.env")
 
-# Cosmos client
-# client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
 _cosmos_client = None
+_container = None
 
-def get_cosmos_client():
+
+
+def get_cosmos_client() -> CosmosClient:
     global _cosmos_client
+
     if _cosmos_client is None:
+        logger.info("Initializing Cosmos client (Gateway mode)")
         _cosmos_client = CosmosClient(
             COSMOS_ENDPOINT,
             COSMOS_KEY,
-            request_timeout=15,      # increase timeout
-            connection_timeout=15
+            connection_mode="Gateway",
+            request_timeout=10
         )
+
     return _cosmos_client
 
 
-# =====================================================
-#  Get DB + container (partition key = /project_name)
-# =====================================================
-def _get_db_and_container():
+
+def get_container():
+    global _container
+
+    if _container is not None:
+        return _container
+
     client = get_cosmos_client()
 
-    db = client.create_database_if_not_exists(id=COSMOS_DATABASE)
-    container = db.create_container_if_not_exists(
-        id=COSMOS_CONTAINER,
-        partition_key=PartitionKey(path="/project_name"),   # << IMPORTANT
-        offer_throughput=400
+    logger.info("Ensuring database exists: %s", COSMOS_DATABASE)
+    database = client.create_database_if_not_exists(
+        id=COSMOS_DATABASE,
+        request_options={"timeout": 20}
     )
-    return db, container
+
+    logger.info(
+        " Ensuring container exists: %s (partition=/project_name)",
+        COSMOS_CONTAINER
+    )
+    _container = database.create_container_if_not_exists(
+        id=COSMOS_CONTAINER,
+        partition_key=PartitionKey(path="/project_name"),
+        request_options={"timeout": 20}
+    )
+
+    logger.info("Cosmos DB & container ready")
+    return _container
 
 
-# =====================================================
-#  Append message
-# =====================================================
-def append_message(project_name: str, thread_id: str, role: str, content: str, metadata: dict = None):
-    _, container = _get_db_and_container()
 
-    msg = {
+def append_message(
+    project_name: str,
+    thread_id: str,
+    role: str,
+    content: str,
+    metadata: dict | None = None
+):
+    container = get_container()
+
+    item = {
         "id": str(uuid.uuid4()),
-        "project_name": project_name,      # << partition key
+        "project_name": project_name,
         "thread_id": thread_id,
         "role": role,
         "content": content,
@@ -548,19 +783,22 @@ def append_message(project_name: str, thread_id: str, role: str, content: str, m
         "metadata": metadata or {},
     }
 
-    return container.create_item(body=msg)
+    return container.create_item(body=item)
 
 
-# =====================================================
-#  Load messages for a thread (partition-safe)
-# =====================================================
-def load_messages(project_name: str, thread_id: str, max_items: int = 1000):
-    _, container = _get_db_and_container()
+
+def load_messages(
+    project_name: str,
+    thread_id: str,
+    max_items: int = 1000
+):
+    container = get_container()
 
     query = """
         SELECT c.id, c.thread_id, c.role, c.content, c.timestamp
         FROM c
-        WHERE c.project_name = @project_name AND c.thread_id = @thread_id
+        WHERE c.project_name = @project_name
+          AND c.thread_id = @thread_id
         ORDER BY c.timestamp ASC
     """
 
@@ -569,24 +807,24 @@ def load_messages(project_name: str, thread_id: str, max_items: int = 1000):
         {"name": "@thread_id", "value": thread_id},
     ]
 
-    return list(container.query_items(
-        query=query,
-        parameters=params,
-        enable_cross_partition_query=False,   # works because project_name is the partition
-        max_item_count=max_items
-    ))
+    return list(
+        container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=False,
+            max_item_count=max_items
+        )
+    )
 
 
-# =====================================================
-#  List threads with preview (same project only)
-# =====================================================
+
 def list_threads_with_preview(project_name: str, limit: int = 100):
-    _, container = _get_db_and_container()
-
+    container = get_container()
     top_k = max(limit * 5, 200)
 
     query = f"""
-        SELECT TOP {top_k} c.thread_id, c.content, c.timestamp
+        SELECT TOP {top_k}
+            c.thread_id, c.content, c.timestamp
         FROM c
         WHERE c.project_name = @project_name
         ORDER BY c.timestamp DESC
@@ -594,29 +832,31 @@ def list_threads_with_preview(project_name: str, limit: int = 100):
 
     params = [{"name": "@project_name", "value": project_name}]
 
-    items = list(container.query_items(
-        query=query,
-        parameters=params,
-        enable_cross_partition_query=False
-    ))
+    items = list(
+        container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=False
+        )
+    )
 
     seen = set()
     results = []
 
-    for it in items:
-        tid = it.get("thread_id")
+    for item in items:
+        tid = item.get("thread_id")
         if not tid or tid in seen:
             continue
+
         seen.add(tid)
 
-        preview = (it.get("content") or "")
-        if len(preview) > 200:
-            preview = preview[:200] + " ..."
+        content = item.get("content") or ""
+        preview = content[:200] + " ..." if len(content) > 200 else content
 
         results.append({
             "thread_id": tid,
             "preview": preview,
-            "timestamp": it.get("timestamp")
+            "timestamp": item.get("timestamp")
         })
 
         if len(results) >= limit:
@@ -625,11 +865,9 @@ def list_threads_with_preview(project_name: str, limit: int = 100):
     return results
 
 
-# =====================================================
-#  Read single message (debug)
-# =====================================================
+
 def read_message(project_name: str, item_id: str):
-    _, container = _get_db_and_container()
+    container = get_container()
     try:
         return container.read_item(
             item=item_id,
@@ -639,16 +877,15 @@ def read_message(project_name: str, item_id: str):
         return None
 
 
-# =====================================================
-#  Delete all messages for a thread (partition-safe)
-# =====================================================
+
 def delete_thread(project_name: str, thread_id: str):
-    _, container = _get_db_and_container()
+    container = get_container()
 
     query = """
         SELECT c.id
         FROM c
-        WHERE c.project_name = @project_name AND c.thread_id = @thread_id
+        WHERE c.project_name = @project_name
+          AND c.thread_id = @thread_id
     """
 
     params = [
@@ -656,44 +893,35 @@ def delete_thread(project_name: str, thread_id: str):
         {"name": "@thread_id", "value": thread_id},
     ]
 
-    items = list(container.query_items(
-        query=query,
-        parameters=params,
-        enable_cross_partition_query=False
-    ))
+    items = list(
+        container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=False
+        )
+    )
 
-    deleted = 0
     for doc in items:
-        try:
-            container.delete_item(
-                item=doc["id"],
-                partition_key=project_name
-            )
-            deleted += 1
-        except Exception as e:
-            print(f"Error deleting {doc['id']}: {e}")
+        container.delete_item(
+            item=doc["id"],
+            partition_key=project_name
+        )
 
-    print(f"🗑️ Deleted {deleted} messages from thread {thread_id} in project {project_name}")
+    logger.info(
+        "Deleted %d messages from thread %s (project=%s)",
+        len(items), thread_id, project_name
+    )
     return True
 
 
-# =====================================================
-#  Cosmos connectivity test
-# =====================================================
-_cosmos_available = None
 
 def cosmos_is_available() -> bool:
-    client = get_cosmos_client()
-
-    global _cosmos_available
-
-    if _cosmos_available is True:
-        return True
-
     try:
-        client.get_database_client(COSMOS_DATABASE).read()
-        _cosmos_available = True
+        client = get_cosmos_client()
+        client.get_database_client(COSMOS_DATABASE).read(
+            request_options={"timeout": 10}
+        )
         return True
-    except Exception:
-        _cosmos_available = False
+    except Exception as e:
+        logger.warning("Cosmos unavailable: %s", str(e))
         return False
