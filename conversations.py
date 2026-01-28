@@ -310,19 +310,16 @@ except Exception as e:
     client = None
 
 def _get_container():
-    """Helper to get the container client, creating DB/Container if needed."""
     if not client:
         raise HTTPException(500, "Cosmos DB client is not initialized.")
-    
+
     try:
-        db = client.create_database_if_not_exists(id=COSMOS_DATABASE)
-        container = db.create_container_if_not_exists(
-            id=COSMOS_CONTAINER,
-            partition_key=PartitionKey(path="/thread_id"),
-        )
+        db = client.get_database_client(COSMOS_DATABASE)
+        container = db.get_container_client(COSMOS_CONTAINER)
         return container
-    except Exception as e:
-        raise HTTPException(500, f"Failed to connect to container: {e}")
+    except exceptions.CosmosResourceNotFoundError:
+        raise HTTPException(500, "Cosmos DB container not found. Create it once in Azure Portal.")
+
 
 # =========================================================
 # 2. STORAGE HELPER FUNCTIONS (Embedded from cosmos_store.py)
